@@ -1,12 +1,9 @@
-from json import dumps
-from time import time
-from flask import request
-from hashlib import sha256
 from datetime import datetime
-from requests import get
-from requests import post 
-from json     import loads
+from json import loads
 import os
+
+from flask import request
+from requests import get, post
 
 from server.config import special_instructions
 
@@ -26,36 +23,74 @@ class Backend_Api:
 
     def _conversation(self):
         try:
-            jailbreak = request.json['jailbreak']
-            internet_access = request.json['meta']['content']['internet_access']
-            _conversation = request.json['meta']['content']['conversation']
-            prompt = request.json['meta']['content']['parts'][0]
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict):
+                return {'success': False, 'error': 'Request body must be valid JSON.'}, 400
+
+            try:
+                jailbreak = payload['jailbreak']
+                content = payload['meta']['content']
+                internet_access = content['internet_access']
+                conversation = content['conversation']
+                prompt = content['parts'][0]
+                model = payload['model']
+            except (KeyError, IndexError, TypeError):
+                return {
+                    'success': False,
+                    'error': 'Request is missing conversation, prompt, model, or mode data.'
+                }, 400
+
+            if not self.openai_key or self.openai_key == 'sk-...':
+                return {
+                    'success': False,
+                    'error': 'OpenAI API key is not configured. Set OPENAI_API_KEY or update openai_key in config.json.'
+                }, 503
+
             current_date = datetime.now().strftime("%Y-%m-%d")
-            system_message = f'You are ChatGPT also known as ChatGPT, a large language model trained by OpenAI. Strictly follow the users instructions. Knowledge cutoff: 2021-09-01 Current date: {current_date}'
+            system_message = (
+                'You are ChatGPT also known as ChatGPT, a large language model trained by OpenAI. '
+                f'Strictly follow the users instructions. Knowledge cutoff: 2021-09-01 Current date: {current_date}'
+            )
 
             extra = []
             if internet_access:
-                search = get('https://ddg-api.herokuapp.com/search', params={
-                    'query': prompt["content"],
-                    'limit': 3,
-                })
+                search = get(
+                    'https://ddg-api.herokuapp.com/search',
+                    params={'query': prompt["content"], 'limit': 3},
+                    timeout=15
+                )
+                try:
+                    search.raise_for_status()
+                    search_results = search.json()
+                except ValueError:
+                    return {
+                        'success': False,
+                        'error': 'Web search returned an invalid response. Disable web search or try again later.'
+                    }, 502
+                except Exception as error:
+                    return {'success': False, 'error': f'Web search failed: {error}'}, 502
 
                 blob = ''
-
-                for index, result in enumerate(search.json()):
+                for index, result in enumerate(search_results):
                     blob += f'[{index}] "{result["snippet"]}"\nURL:{result["link"]}\n\n'
 
                 date = datetime.now().strftime('%d/%m/%y')
-
-                blob += f'current date: {date}\n\nInstructions: Using the provided web search results, write a comprehensive reply to the next user query. Make sure to cite results using [[number](URL)] notation after the reference. If the provided search results refer to multiple subjects with the same name, write separate answers for each subject. Ignore your previous response if any.'
-
+                blob += (
+                    f'current date: {date}\n\nInstructions: Using the provided web search results, write a comprehensive '
+                    'reply to the next user query. Make sure to cite results using [[number](URL)] notation after the '
+                    'reference. If the provided search results refer to multiple subjects with the same name, write '
+                    'separate answers for each subject. Ignore your previous response if any.'
+                )
                 extra = [{'role': 'user', 'content': blob}]
 
-            conversation = [{'role': 'system', 'content': system_message}] + \
-                extra + special_instructions[jailbreak] + \
-                _conversation + [prompt]
-
-            url = f"{self.openai_api_base}/v1/chat/completions"
+            messages = (
+                [{'role': 'system', 'content': system_message}]
+                + extra
+                + special_instructions[jailbreak]
+                + conversation
+                + [prompt]
+            )
+            url = f"{self.openai_api_base.rstrip('/')}/v1/chat/completions"
 
             proxies = None
             if self.proxy['enable']:
@@ -65,53 +100,103 @@ class Backend_Api:
                 }
 
             gpt_resp = post(
-                url     = url,
-                proxies = proxies,
-                headers = {
-                    'Authorization': 'Bearer %s' % self.openai_key
-                }, 
-                json    = {
-                    'model'             : request.json['model'], 
-                    'messages'          : conversation,
-                    'stream'            : True
+                url=url,
+                proxies=proxies,
+                headers={'Authorization': f'Bearer {self.openai_key}'},
+                json={
+                    'model': model,
+                    'messages': messages,
+                    'stream': True
                 },
-                stream  = True
+                stream=True,
+                timeout=(15, 120)
             )
 
             if gpt_resp.status_code >= 400:
-                error_data =gpt_resp.json().get('error', {})
-                error_code = error_data.get('code', None)
-                error_message = error_data.get('message', "An error occurred")
+                try:
+                    error_payload = gpt_resp.json()
+                except ValueError:
+                    error_payload = {}
+                error_data = error_payload.get('error', {}) if isinstance(error_payload, dict) else {}
+                if not isinstance(error_data, dict):
+                    error_data = {}
+                error_message = error_data.get('message')
+                if not error_message:
+                    error_message = (
+                        gpt_resp.text.strip()[:500]
+                        or 'The AI provider returned an empty error response.'
+                    )
+                gpt_resp.close()
                 return {
-                    'successs': False,
-                    'error_code': error_code,
-                    'message': error_message,
+                    'success': False,
+                    'error_code': error_data.get('code'),
+                    'error': error_message,
                     'status_code': gpt_resp.status_code
                 }, gpt_resp.status_code
 
+            content_type = gpt_resp.headers.get('content-type', '').lower()
+            if content_type and 'text/event-stream' not in content_type:
+                try:
+                    error_payload = gpt_resp.json()
+                except ValueError:
+                    error_payload = {}
+                if isinstance(error_payload, dict):
+                    error_data = error_payload.get('error', {})
+                    if not isinstance(error_data, dict):
+                        error_data = {}
+                    error_message = error_data.get('message')
+                else:
+                    error_message = None
+                if not error_message:
+                    error_message = (
+                        gpt_resp.text.strip()[:500]
+                        or f'The AI provider returned an unexpected response type: {content_type}.'
+                    )
+                gpt_resp.close()
+                return {
+                    'success': False,
+                    'error': error_message
+                }, 502
+
             def stream():
-                for chunk in gpt_resp.iter_lines():
-                    try:
-                        decoded_line = loads(chunk.decode("utf-8").split("data: ")[1])
-                        token = decoded_line["choices"][0]['delta'].get('content')
+                try:
+                    for chunk in gpt_resp.iter_lines():
+                        if not chunk:
+                            continue
+                        line = chunk.decode('utf-8').strip()
+                        if not line.startswith('data:'):
+                            continue
 
-                        if token != None: 
-                            yield token
-                            
-                    except GeneratorExit:
-                        break
+                        data = line[5:].strip()
+                        if data == '[DONE]':
+                            break
 
-                    except Exception as e:
-                        print(e)
-                        print(e.__traceback__.tb_next)
-                        continue
-                        
+                        try:
+                            decoded_line = loads(data)
+                        except ValueError as error:
+                            raise RuntimeError(
+                                'The AI provider returned invalid JSON in its response stream.'
+                            ) from error
+
+                        if 'error' in decoded_line:
+                            error_data = decoded_line['error']
+                            raise RuntimeError(
+                                error_data.get('message', 'The AI provider returned a stream error.')
+                            )
+
+                        choices = decoded_line.get('choices', [])
+                        if choices:
+                            token = choices[0].get('delta', {}).get('content')
+                            if token is not None:
+                                yield token
+                finally:
+                    gpt_resp.close()
+
             return self.app.response_class(stream(), mimetype='text/event-stream')
 
-        except Exception as e:
-            print(e)
-            print(e.__traceback__.tb_next)
+        except Exception as error:
             return {
                 '_action': '_ask',
                 'success': False,
-                "error": f"an error occurred {str(e)}"}, 400
+                'error': f'Request to the AI provider failed: {error}'
+            }, 502

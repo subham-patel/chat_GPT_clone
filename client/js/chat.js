@@ -2,12 +2,10 @@ const query = (obj) =>
   Object.keys(obj)
     .map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(obj[k]))
     .join("&");
-const colorThemes = document.querySelectorAll('[name="theme"]');
 const markdown = window.markdownit();
 const message_box = document.getElementById(`messages`);
 const message_input = document.getElementById(`message-input`);
-const box_conversations = document.querySelector(`.top`);
-const spinner = box_conversations.querySelector(".spinner");
+const box_conversations = document.getElementById(`conversation-list`);
 const stop_generating = document.querySelector(`.stop_generating`);
 const send_button = document.querySelector(`#send-button`);
 let prompt_lock = false;
@@ -15,12 +13,18 @@ let prompt_lock = false;
 hljs.addPlugin(new CopyButtonPlugin());
 
 function resizeTextarea(textarea) {
-  textarea.style.height = '80px';
-  textarea.style.height = Math.min(textarea.scrollHeight, 200) + 'px';
+  textarea.style.height = 'auto';
+  textarea.style.height = Math.min(textarea.scrollHeight, 180) + 'px';
 }
 
 const format = (text) => {
-  return text.replace(/(?:\r\n|\r|\n)/g, "<br>");
+  return escape_html(text).replace(/(?:\r\n|\r|\n)/g, "<br>");
+};
+
+const escape_html = (text) => {
+  const element = document.createElement("div");
+  element.textContent = text;
+  return element.innerHTML;
 };
 
 message_input.addEventListener("blur", () => {
@@ -32,12 +36,15 @@ message_input.addEventListener("focus", () => {
 });
 
 const delete_conversations = async () => {
-  localStorage.clear();
+  if (!window.confirm("Delete all saved conversations? This cannot be undone.")) return;
+  Object.keys(localStorage)
+    .filter((key) => key.startsWith("conversation:"))
+    .forEach((key) => localStorage.removeItem(key));
   await new_conversation();
 };
 
 const handle_ask = async () => {
-  message_input.style.height = `80px`;
+  message_input.style.height = `35px`;
   message_input.focus();
 
   window.scrollTo(0, 0);
@@ -59,6 +66,7 @@ const remove_cancel_button = async () => {
 };
 
 const ask_gpt = async (message) => {
+  let text = ``;
   try {
     message_input.value = ``;
     message_input.innerHTML = ``;
@@ -68,10 +76,9 @@ const ask_gpt = async (message) => {
     window.scrollTo(0, 0);
     window.controller = new AbortController();
 
-    jailbreak = document.getElementById("jailbreak");
-    model = document.getElementById("model");
+    const jailbreak = document.getElementById("jailbreak");
+    const model = document.getElementById("model");
     prompt_lock = true;
-    window.text = ``;
     window.token = message_id();
 
     stop_generating.classList.remove(`stop_generating-hidden`);
@@ -82,7 +89,7 @@ const ask_gpt = async (message) => {
                     ${user_image}
                     <i class="fa-regular fa-phone-arrow-up-right"></i>
                 </div>
-                <div class="content" id="user_${token}"> 
+                <div class="content" id="user_${window.token}">
                     ${format(message)}
                 </div>
             </div>
@@ -140,13 +147,33 @@ const ask_gpt = async (message) => {
       }),
     });
 
+    if (!response.ok) {
+      const responseText = await response.text();
+      let errorMessage = responseText;
+      try {
+        const errorResponse = JSON.parse(responseText);
+        errorMessage = errorResponse.error || errorResponse.message || responseText;
+      } catch (parseError) {
+        if (!(parseError instanceof SyntaxError)) throw parseError;
+      }
+      throw new Error(errorMessage || `Request failed with status ${response.status}.`);
+    }
+
+    if (!response.body) {
+      throw new Error("The server returned an empty response stream.");
+    }
+
     const reader = response.body.getReader();
+    const decoder = new TextDecoder();
 
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        text += decoder.decode();
+        break;
+      }
 
-      chunk = new TextDecoder().decode(value);
+      let chunk = decoder.decode(value, { stream: true });
 
       if (
         chunk.includes(
@@ -210,13 +237,13 @@ const ask_gpt = async (message) => {
     let cursorDiv = document.getElementById(`cursor`);
     if (cursorDiv) cursorDiv.parentNode.removeChild(cursorDiv);
 
-    if (e.name != `AbortError`) {
-      let error_message = `oops ! something went wrong, please try again / reload. [stacktrace in console]`;
-
-      document.getElementById(`gpt_${window.token}`).innerHTML = error_message;
+    const responseContainer = document.getElementById(`gpt_${window.token}`);
+    if (e.name !== `AbortError`) {
+      const error_message = e.message || "The request failed. Please try again.";
+      if (responseContainer) responseContainer.textContent = error_message;
       add_message(window.conversation_id, "assistant", error_message);
     } else {
-      document.getElementById(`gpt_${window.token}`).innerHTML += ` [aborted]`;
+      if (responseContainer) responseContainer.textContent += ` [aborted]`;
       add_message(window.conversation_id, "assistant", text + ` [aborted]`);
     }
 
@@ -225,20 +252,7 @@ const ask_gpt = async (message) => {
 };
 
 const clear_conversations = async () => {
-  const elements = box_conversations.childNodes;
-  let index = elements.length;
-
-  if (index > 0) {
-    while (index--) {
-      const element = elements[index];
-      if (
-        element.nodeType === Node.ELEMENT_NODE &&
-        element.tagName.toLowerCase() !== `button`
-      ) {
-        box_conversations.removeChild(element);
-      }
-    }
-  }
+  box_conversations.innerHTML = "";
 };
 
 const clear_conversation = async () => {
@@ -273,7 +287,7 @@ const delete_conversation = async (conversation_id) => {
   localStorage.removeItem(`conversation:${conversation_id}`);
 
   const conversation = document.getElementById(`convo-${conversation_id}`);
-    conversation.remove();
+  if (conversation) conversation.remove();
 
   if (window.conversation_id == conversation_id) {
     await new_conversation();
@@ -289,6 +303,7 @@ const set_conversation = async (conversation_id) => {
   await clear_conversation();
   await load_conversation(conversation_id);
   await load_conversations(20, 0, true);
+  toggle_sidebar(false);
 };
 
 const new_conversation = async () => {
@@ -297,15 +312,15 @@ const new_conversation = async () => {
 
   await clear_conversation();
   await load_conversations(20, 0, true);
+  toggle_sidebar(false);
 };
 
 const load_conversation = async (conversation_id) => {
-  let conversation = await JSON.parse(
-    localStorage.getItem(`conversation:${conversation_id}`)
-  );
-  console.log(conversation, conversation_id);
+  const storedConversation = localStorage.getItem(`conversation:${conversation_id}`);
+  if (!storedConversation) return;
+  const conversation = JSON.parse(storedConversation);
 
-  for (item of conversation.items) {
+  for (const item of conversation.items) {
     message_box.innerHTML += `
             <div class="message">
                 <div class="user">
@@ -320,7 +335,7 @@ const load_conversation = async (conversation_id) => {
                     ${
                       item.role == "assistant"
                         ? markdown.render(item.content)
-                        : item.content
+                        : format(item.content)
                     }
                 </div>
             </div>
@@ -353,13 +368,14 @@ const add_conversation = async (conversation_id, title) => {
         id: conversation_id,
         title: title,
         items: [],
+        updatedAt: Date.now(),
       })
     );
   }
 };
 
 const add_message = async (conversation_id, role, content) => {
-  before_adding = JSON.parse(
+  const before_adding = JSON.parse(
     localStorage.getItem(`conversation:${conversation_id}`)
   );
 
@@ -367,6 +383,7 @@ const add_message = async (conversation_id, role, content) => {
     role: role,
     content: content,
   });
+  before_adding.updatedAt = Date.now();
 
   localStorage.setItem(
     `conversation:${conversation_id}`,
@@ -375,37 +392,38 @@ const add_message = async (conversation_id, role, content) => {
 };
 
 const load_conversations = async (limit, offset, loader) => {
-  //console.log(loader);
-  //if (loader === undefined) box_conversations.appendChild(spinner);
-
-  let conversations = [];
+  const conversations = [];
   for (let i = 0; i < localStorage.length; i++) {
-    if (localStorage.key(i).startsWith("conversation:")) {
-      let conversation = localStorage.getItem(localStorage.key(i));
+    const key = localStorage.key(i);
+    if (key && key.startsWith("conversation:")) {
+      const conversation = localStorage.getItem(key);
       conversations.push(JSON.parse(conversation));
     }
   }
 
-  //if (loader === undefined) spinner.parentNode.removeChild(spinner)
+  conversations.sort((left, right) => {
+    const leftTime = left.updatedAt || 0;
+    const rightTime = right.updatedAt || 0;
+    return rightTime - leftTime;
+  });
   await clear_conversations();
 
-  for (conversation of conversations) {
+  document.getElementById("history-count").textContent = conversations.length;
+  for (const conversation of conversations) {
     box_conversations.innerHTML += `
-    <div class="convo" id="convo-${conversation.id}">
+    <div class="convo ${conversation.id === window.conversation_id ? "active" : ""}" id="convo-${conversation.id}">
       <div class="left" onclick="set_conversation('${conversation.id}')">
           <i class="fa-regular fa-comments"></i>
-          <span class="convo-title">${conversation.title}</span>
+          <span class="convo-title">${escape_html(conversation.title)}</span>
       </div>
-      <i onclick="show_option('${conversation.id}')" class="fa-regular fa-trash" id="conv-${conversation.id}"></i>
-      <i onclick="delete_conversation('${conversation.id}')" class="fa-regular fa-check" id="yes-${conversation.id}" style="display:none;"></i>
-      <i onclick="hide_option('${conversation.id}')" class="fa-regular fa-x" id="not-${conversation.id}" style="display:none;"></i>
+      <button type="button" onclick="show_option('${conversation.id}')" aria-label="Delete conversation" id="conv-${conversation.id}"><i class="fa-regular fa-trash"></i></button>
+      <button type="button" onclick="delete_conversation('${conversation.id}')" aria-label="Confirm delete" id="yes-${conversation.id}" style="display:none;"><i class="fa-regular fa-check"></i></button>
+      <button type="button" onclick="hide_option('${conversation.id}')" aria-label="Cancel delete" id="not-${conversation.id}" style="display:none;"><i class="fa-regular fa-x"></i></button>
     </div>
     `;
   }
 
-  document.querySelectorAll(`code`).forEach((el) => {
-    hljs.highlightElement(el);
-  });
+  filter_conversations(document.getElementById("conversation-search").value);
 };
 
 document.getElementById(`cancelButton`).addEventListener(`click`, async () => {
@@ -436,25 +454,16 @@ const uuid = () => {
 };
 
 const message_id = () => {
-  random_bytes = (Math.floor(Math.random() * 1338377565) + 2956589730).toString(
+  const random_bytes = (Math.floor(Math.random() * 1338377565) + 2956589730).toString(
     2
   );
-  unix = Math.floor(Date.now() / 1000).toString(2);
+  const unix = Math.floor(Date.now() / 1000).toString(2);
 
   return BigInt(`0b${unix}${random_bytes}`).toString();
 };
 
 window.onload = async () => {
   load_settings_localstorage();
-
-  conversations = 0;
-  for (let i = 0; i < localStorage.length; i++) {
-    if (localStorage.key(i).startsWith("conversation:")) {
-      conversations += 1;
-    }
-  }
-
-  if (conversations == 0) localStorage.clear();
 
   await setTimeout(() => {
     load_conversations(20, 0);
@@ -479,7 +488,6 @@ message_input.addEventListener(`keydown`, async (evt) => {
   });
 
   send_button.addEventListener(`click`, async () => {
-    console.log("clicked send");
     if (prompt_lock) return;
     await handle_ask();
   });
@@ -487,24 +495,73 @@ message_input.addEventListener(`keydown`, async (evt) => {
   register_settings_localstorage();
 };
 
-document.querySelector(".mobile-sidebar").addEventListener("click", (event) => {
+const toggle_sidebar = (show) => {
   const sidebar = document.querySelector(".conversations");
+  const shouldShow = show === undefined ? !sidebar.classList.contains("shown") : show;
+  sidebar.classList.toggle("shown", shouldShow);
+};
 
-  if (sidebar.classList.contains("shown")) {
-    sidebar.classList.remove("shown");
-    event.target.classList.remove("rotated");
-  } else {
-    sidebar.classList.add("shown");
-    event.target.classList.add("rotated");
+const filter_conversations = (query) => {
+  const normalizedQuery = query.trim().toLowerCase();
+  document.querySelectorAll(".conversation-list .convo").forEach((conversation) => {
+    const title = conversation.querySelector(".convo-title").textContent.toLowerCase();
+    conversation.hidden = !title.includes(normalizedQuery);
+  });
+};
+
+const use_prompt = (prompt) => {
+  message_input.value = prompt;
+  resizeTextarea(message_input);
+  message_input.focus();
+  message_input.setSelectionRange(prompt.length, prompt.length);
+};
+
+const export_conversation = () => {
+  const storedConversation = localStorage.getItem(`conversation:${window.conversation_id}`);
+  if (!storedConversation) {
+    window.alert("There are no messages to export yet.");
+    return;
   }
 
-  window.scrollTo(0, 0);
+  const conversation = JSON.parse(storedConversation);
+  const markdownText = conversation.items
+    .map((item) => `## ${item.role === "assistant" ? "Assistant" : "You"}\n\n${item.content}`)
+    .join("\n\n---\n\n");
+  const fileName = (conversation.title || "orbit-conversation")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "")
+    .trim()
+    .replace(/\s+/g, "-") || "orbit-conversation";
+  const download = document.createElement("a");
+  const file = new Blob([markdownText], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(file);
+
+  download.href = url;
+  download.download = `${fileName}.md`;
+  download.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+document.getElementById("conversation-search").addEventListener("input", (event) => {
+  filter_conversations(event.target.value);
+});
+
+document.addEventListener("keydown", (event) => {
+  const isTyping = event.target.matches("input, textarea, select");
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+    event.preventDefault();
+    new_conversation();
+  } else if (event.key === "/" && !isTyping) {
+    event.preventDefault();
+    document.getElementById("conversation-search").focus();
+  } else if (event.key === "Escape") {
+    toggle_sidebar(false);
+  }
 });
 
 const register_settings_localstorage = async () => {
-  settings_ids = ["switch", "model", "jailbreak"];
-  settings_elements = settings_ids.map((id) => document.getElementById(id));
-  settings_elements.map((element) =>
+  const settings_ids = ["switch", "model", "jailbreak"];
+  const settings_elements = settings_ids.map((id) => document.getElementById(id));
+  settings_elements.forEach((element) =>
     element.addEventListener(`change`, async (event) => {
       switch (event.target.type) {
         case "checkbox":
@@ -521,9 +578,9 @@ const register_settings_localstorage = async () => {
 };
 
 const load_settings_localstorage = async () => {
-  settings_ids = ["switch", "model", "jailbreak"];
-  settings_elements = settings_ids.map((id) => document.getElementById(id));
-  settings_elements.map((element) => {
+  const settings_ids = ["switch", "model", "jailbreak"];
+  const settings_elements = settings_ids.map((id) => document.getElementById(id));
+  settings_elements.forEach((element) => {
     if (localStorage.getItem(element.id)) {
       switch (element.type) {
         case "checkbox":
@@ -539,29 +596,14 @@ const load_settings_localstorage = async () => {
   });
 };
 
-// Theme storage for recurring viewers
-const storeTheme = function (theme) {
-  localStorage.setItem("theme", theme);
+const themePicker = document.getElementById("theme-select");
+const setTheme = (theme) => {
+  const supportedThemes = ["dark", "light", "blue", "green", "pink"];
+  const activeTheme = supportedThemes.includes(theme) ? theme : "dark";
+  themePicker.value = activeTheme;
+  document.documentElement.dataset.theme = activeTheme;
+  localStorage.setItem("theme", activeTheme);
 };
 
-// set theme when visitor returns
-const setTheme = function () {
-  const activeTheme = localStorage.getItem("theme");
-  colorThemes.forEach((themeOption) => {
-    if (themeOption.id === activeTheme) {
-      themeOption.checked = true;
-    }
-  });
-  // fallback for no :has() support
-  document.documentElement.className = activeTheme;
-};
-
-colorThemes.forEach((themeOption) => {
-  themeOption.addEventListener("click", () => {
-    storeTheme(themeOption.id);
-    // fallback for no :has() support
-    document.documentElement.className = themeOption.id;
-  });
-});
-
-document.onload = setTheme();
+setTheme(localStorage.getItem("theme"));
+themePicker.addEventListener("change", (event) => setTheme(event.target.value));
